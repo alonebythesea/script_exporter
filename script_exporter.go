@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"time"
+	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -40,10 +41,11 @@ type Script struct {
 type Measurement struct {
 	Script   *Script
 	Success  int
+	ExitCode int
 	Duration float64
 }
 
-func runScript(script *Script) error {
+func runScript(script *Script) (err error, ec int) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(script.Timeout)*time.Second)
 	defer cancel()
 
@@ -52,20 +54,23 @@ func runScript(script *Script) error {
 	bashIn, err := bashCmd.StdinPipe()
 
 	if err != nil {
-		return err
-	}
-
-	if err = bashCmd.Start(); err != nil {
-		return err
+		return err, 1
 	}
 
 	if _, err = bashIn.Write([]byte(script.Content)); err != nil {
-		return err
+		return err, 1
+	}
+
+	if err = bashCmd.Run(); err != nil {
+		exitError := err.(*exec.ExitError)
+		ec = exitError.Sys().(syscall.WaitStatus).ExitStatus()
+	} else {
+		ec = bashCmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
 	}
 
 	bashIn.Close()
 
-	return bashCmd.Wait()
+	return err, ec 
 }
 
 func runScripts(scripts []*Script) []*Measurement {
@@ -77,7 +82,7 @@ func runScripts(scripts []*Script) []*Measurement {
 		go func(script *Script) {
 			start := time.Now()
 			success := 0
-			err := runScript(script)
+			err, ec := runScript(script)
 			duration := time.Since(start).Seconds()
 
 			if err == nil {
@@ -91,6 +96,7 @@ func runScripts(scripts []*Script) []*Measurement {
 				Script:   script,
 				Duration: duration,
 				Success:  success,
+				ExitCode: ec,
 			}
 		}(script)
 	}
@@ -144,6 +150,7 @@ func scriptRunHandler(w http.ResponseWriter, r *http.Request, config *Config) {
 	for _, measurement := range measurements {
 		fmt.Fprintf(w, "script_duration_seconds{script=\"%s\"} %f\n", measurement.Script.Name, measurement.Duration)
 		fmt.Fprintf(w, "script_success{script=\"%s\"} %d\n", measurement.Script.Name, measurement.Success)
+		fmt.Fprintf(w, "script_exit_code{script=\"%s\"} %d\n", measurement.Script.Name, measurement.ExitCode)
 	}
 }
 
